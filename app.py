@@ -1,22 +1,19 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
-import math
+import matplotlib.pyplot as plt
+import seaborn as sns
 from datetime import datetime, timedelta
-import io
+import math
 
-# Page configuration
+# Set page config
 st.set_page_config(
     page_title="Solar PV System Analyzer",
     page_icon="☀️",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# Custom CSS
+# Custom styling
 st.markdown("""
 <style>
     .main-header {
@@ -26,525 +23,489 @@ st.markdown("""
         text-align: center;
         margin-bottom: 2rem;
     }
-    .section-header {
-        font-size: 1.5rem;
-        font-weight: bold;
-        color: #2E86AB;
-        margin-top: 2rem;
-        margin-bottom: 1rem;
-    }
-    .metric-card {
+    .metric-box {
         background-color: #f0f8ff;
         padding: 1rem;
         border-radius: 10px;
         border-left: 5px solid #2E86AB;
+        margin: 0.5rem 0;
+    }
+    .section-header {
+        color: #2E86AB;
+        font-weight: bold;
+        font-size: 1.3rem;
+        margin-top: 1.5rem;
     }
 </style>
 """, unsafe_allow_html=True)
 
 # Helper functions
-def calculate_solar_position(latitude, day_of_year, hour):
-    """Calculate solar position (elevation and azimuth)"""
-    # Solar declination
-    declination = 23.45 * np.sin(np.radians(360 * (284 + day_of_year) / 365))
+@st.cache_data
+def calculate_solar_angles(latitude, day_of_year, hour):
+    """Calculate solar elevation and azimuth angles"""
+    # Solar declination angle
+    declination = 23.45 * math.sin(math.radians(360 * (284 + day_of_year) / 365))
     
     # Hour angle
     hour_angle = 15 * (hour - 12)
     
-    # Solar elevation
-    elevation = np.arcsin(
-        np.sin(np.radians(declination)) * np.sin(np.radians(latitude)) +
-        np.cos(np.radians(declination)) * np.cos(np.radians(latitude)) * np.cos(np.radians(hour_angle))
+    # Convert to radians
+    lat_rad = math.radians(latitude)
+    dec_rad = math.radians(declination)
+    hour_rad = math.radians(hour_angle)
+    
+    # Solar elevation angle
+    elevation_rad = math.asin(
+        math.sin(dec_rad) * math.sin(lat_rad) + 
+        math.cos(dec_rad) * math.cos(lat_rad) * math.cos(hour_rad)
+    )
+    elevation = math.degrees(elevation_rad)
+    
+    # Solar azimuth angle
+    if elevation > 0:
+        azimuth_rad = math.atan2(
+            math.sin(hour_rad),
+            math.cos(hour_rad) * math.sin(lat_rad) - math.tan(dec_rad) * math.cos(lat_rad)
+        )
+        azimuth = math.degrees(azimuth_rad)
+    else:
+        azimuth = 0
+    
+    return max(0, elevation), azimuth
+
+@st.cache_data
+def calculate_panel_irradiance(ghi, solar_elevation, panel_tilt, solar_azimuth, panel_azimuth):
+    """Calculate irradiance on tilted panel surface"""
+    if solar_elevation <= 0 or ghi <= 0:
+        return 0
+    
+    # Convert angles to radians
+    panel_tilt_rad = math.radians(panel_tilt)
+    solar_elev_rad = math.radians(solar_elevation)
+    angle_diff_rad = math.radians(solar_azimuth - panel_azimuth)
+    
+    # Calculate angle of incidence
+    cos_incidence = (
+        math.sin(solar_elev_rad) * math.cos(panel_tilt_rad) +
+        math.cos(solar_elev_rad) * math.sin(panel_tilt_rad) * math.cos(angle_diff_rad)
     )
     
-    # Solar azimuth
-    azimuth = np.arctan2(
-        np.sin(np.radians(hour_angle)),
-        np.cos(np.radians(hour_angle)) * np.sin(np.radians(latitude)) - 
-        np.tan(np.radians(declination)) * np.cos(np.radians(latitude))
-    )
+    # Ensure we don't get negative values
+    cos_incidence = max(0, cos_incidence)
     
-    return np.degrees(elevation), np.degrees(azimuth)
+    # Simple tilted surface irradiance model
+    # Direct component
+    direct_normal = ghi / math.sin(solar_elev_rad) if math.sin(solar_elev_rad) > 0 else 0
+    direct_tilted = direct_normal * cos_incidence
+    
+    # Diffuse component (isotropic sky model)
+    diffuse_horizontal = ghi * 0.1  # Simplified assumption
+    diffuse_tilted = diffuse_horizontal * (1 + math.cos(panel_tilt_rad)) / 2
+    
+    # Ground reflected component
+    albedo = 0.2
+    reflected = ghi * albedo * (1 - math.cos(panel_tilt_rad)) / 2
+    
+    total_irradiance = direct_tilted + diffuse_tilted + reflected
+    return max(0, total_irradiance)
 
-def calculate_irradiance(dni, dhi, ghi, solar_elevation, panel_tilt, panel_azimuth, solar_azimuth):
-    """Calculate irradiance on tilted surface"""
-    if solar_elevation <= 0:
-        return 0, 0, 0
-    
-    # Angle of incidence
-    aoi = np.arccos(
-        np.sin(np.radians(solar_elevation)) * np.cos(np.radians(panel_tilt)) +
-        np.cos(np.radians(solar_elevation)) * np.sin(np.radians(panel_tilt)) * 
-        np.cos(np.radians(solar_azimuth - panel_azimuth))
-    )
-    
-    # Beam irradiance on tilted surface
-    beam_tilted = dni * np.cos(aoi) if aoi < np.pi/2 else 0
-    
-    # Diffuse irradiance on tilted surface (isotropic sky model)
-    diffuse_tilted = dhi * (1 + np.cos(np.radians(panel_tilt))) / 2
-    
-    # Ground reflected irradiance
-    albedo = 0.2  # Ground reflectance
-    ground_reflected = ghi * albedo * (1 - np.cos(np.radians(panel_tilt))) / 2
-    
-    # Total irradiance
-    total_irradiance = beam_tilted + diffuse_tilted + ground_reflected
-    
-    return total_irradiance, beam_tilted, diffuse_tilted
-
-def calculate_pv_power(irradiance, temperature, panel_power, temperature_coeff, noct):
-    """Calculate PV power output"""
-    # Cell temperature estimation
-    cell_temp = temperature + (noct - 20) * irradiance / 800
-    
-    # Temperature derating
-    temp_derating = 1 + temperature_coeff * (cell_temp - 25) / 100
-    
-    # Power output
-    power = panel_power * (irradiance / 1000) * temp_derating
-    
-    return max(0, power), cell_temp
-
-def generate_weather_data(latitude, days=365):
+@st.cache_data
+def generate_weather_data(latitude, num_days=365):
     """Generate synthetic weather data"""
     np.random.seed(42)  # For reproducible results
     
-    data = []
-    for day in range(1, days + 1):
-        # Seasonal temperature variation
-        temp_base = 20 + 15 * np.sin(2 * np.pi * (day - 80) / 365)
+    weather_data = []
+    
+    for day in range(1, num_days + 1):
+        # Base temperature with seasonal variation
+        temp_base = 20 + 15 * math.sin(2 * math.pi * (day - 80) / 365)
         
         for hour in range(24):
             # Daily temperature variation
-            temp_variation = -5 * np.cos(2 * np.pi * hour / 24)
-            temperature = temp_base + temp_variation + np.random.normal(0, 3)
+            temp_daily = -8 * math.cos(2 * math.pi * hour / 24)
+            temperature = temp_base + temp_daily + np.random.normal(0, 2)
             
-            # Solar elevation for irradiance calculation
-            solar_elev, solar_az = calculate_solar_position(latitude, day, hour)
+            # Calculate solar position
+            solar_elev, solar_azim = calculate_solar_angles(latitude, day, hour)
             
+            # Generate irradiance based on solar elevation
             if solar_elev > 0:
-                # Clear sky irradiance model
-                ghi_clear = 1000 * np.sin(np.radians(solar_elev)) * 0.7
+                # Clear sky irradiance
+                clear_sky_ghi = 1000 * math.sin(math.radians(solar_elev)) * 0.75
                 
-                # Add cloud effects
-                cloud_factor = np.random.uniform(0.3, 1.0)
-                ghi = ghi_clear * cloud_factor
-                dni = ghi * 0.8 if ghi > 100 else 0
-                dhi = ghi - dni * np.sin(np.radians(solar_elev))
+                # Add random cloud effects
+                cloud_factor = np.random.uniform(0.2, 1.0)
+                ghi = clear_sky_ghi * cloud_factor
             else:
-                ghi = dni = dhi = 0
+                ghi = 0
             
-            data.append({
+            weather_data.append({
+                'day': day,
+                'hour': hour,
                 'datetime': datetime(2024, 1, 1) + timedelta(days=day-1, hours=hour),
-                'temperature': temperature,
-                'ghi': max(0, ghi),
-                'dni': max(0, dni),
-                'dhi': max(0, dhi),
-                'solar_elevation': solar_elev,
-                'solar_azimuth': solar_az
+                'temperature': round(temperature, 1),
+                'ghi': round(max(0, ghi), 1),
+                'solar_elevation': round(solar_elev, 1),
+                'solar_azimuth': round(solar_azim, 1)
             })
     
-    return pd.DataFrame(data)
+    return pd.DataFrame(weather_data)
+
+def calculate_pv_performance(weather_df, system_params):
+    """Calculate PV system performance"""
+    results = []
+    
+    for _, row in weather_df.iterrows():
+        # Calculate panel irradiance
+        panel_irradiance = calculate_panel_irradiance(
+            row['ghi'], 
+            row['solar_elevation'],
+            system_params['panel_tilt'],
+            row['solar_azimuth'],
+            system_params['panel_azimuth']
+        )
+        
+        # Calculate cell temperature
+        cell_temp = row['temperature'] + (system_params['noct'] - 20) * panel_irradiance / 800
+        
+        # Temperature derating
+        temp_coeff = system_params['temp_coeff'] / 100  # Convert to decimal
+        temp_derating = 1 + temp_coeff * (cell_temp - 25)
+        
+        # DC power calculation
+        dc_power = (
+            system_params['total_power'] * 
+            (panel_irradiance / 1000) * 
+            temp_derating
+        )
+        dc_power = max(0, dc_power)
+        
+        # AC power calculation (apply system losses)
+        system_efficiency = (
+            (100 - system_params['dc_losses']) / 100 *
+            system_params['inverter_eff'] / 100 *
+            (100 - system_params['ac_losses']) / 100
+        )
+        ac_power = dc_power * system_efficiency
+        
+        results.append({
+            'datetime': row['datetime'],
+            'day': row['day'],
+            'hour': row['hour'],
+            'temperature': row['temperature'],
+            'ghi': row['ghi'],
+            'panel_irradiance': round(panel_irradiance, 1),
+            'cell_temperature': round(cell_temp, 1),
+            'dc_power': round(dc_power, 1),
+            'ac_power': round(ac_power, 1)
+        })
+    
+    return pd.DataFrame(results)
 
 # Main application
 def main():
     st.markdown('<h1 class="main-header">☀️ Solar PV System Analyzer</h1>', unsafe_allow_html=True)
     
-    # Sidebar for system parameters
-    st.sidebar.markdown("## System Configuration")
+    # Sidebar configuration
+    st.sidebar.header("⚙️ System Configuration")
     
-    # Location parameters
-    st.sidebar.markdown("### Location")
-    latitude = st.sidebar.slider("Latitude (°)", -90.0, 90.0, 40.7, 0.1)
+    # Location settings
+    st.sidebar.subheader("📍 Location")
+    latitude = st.sidebar.slider("Latitude (°)", -60.0, 60.0, 40.7, 0.1)
     longitude = st.sidebar.slider("Longitude (°)", -180.0, 180.0, -74.0, 0.1)
     
-    # PV System parameters
-    st.sidebar.markdown("### PV System")
-    panel_power = st.sidebar.number_input("Panel Power (W)", 100, 1000, 400)
-    num_panels = st.sidebar.number_input("Number of Panels", 1, 1000, 20)
-    panel_tilt = st.sidebar.slider("Panel Tilt (°)", 0, 90, 30)
-    panel_azimuth = st.sidebar.slider("Panel Azimuth (°)", -180, 180, 180)
+    # System specifications
+    st.sidebar.subheader("🔧 PV System")
+    panel_power = st.sidebar.number_input("Panel Power (W)", 100, 1000, 400, 50)
+    num_panels = st.sidebar.number_input("Number of Panels", 1, 500, 25, 1)
+    panel_tilt = st.sidebar.slider("Panel Tilt (°)", 0, 90, 30, 1)
+    panel_azimuth = st.sidebar.slider("Panel Azimuth (°)", 0, 360, 180, 5)
     
-    # Panel specifications
-    st.sidebar.markdown("### Panel Specifications")
-    temperature_coeff = st.sidebar.slider("Temperature Coefficient (%/°C)", -1.0, 0.0, -0.4, 0.01)
-    noct = st.sidebar.slider("NOCT (°C)", 40, 50, 45)
+    # Advanced parameters
+    st.sidebar.subheader("⚡ Performance Parameters")
+    temp_coeff = st.sidebar.slider("Temperature Coefficient (%/°C)", -1.0, 0.0, -0.4, 0.05)
+    noct = st.sidebar.slider("NOCT (°C)", 40, 50, 45, 1)
     
     # System losses
-    st.sidebar.markdown("### System Losses")
-    dc_losses = st.sidebar.slider("DC Losses (%)", 0, 20, 5)
-    inverter_efficiency = st.sidebar.slider("Inverter Efficiency (%)", 80, 99, 96)
-    ac_losses = st.sidebar.slider("AC Losses (%)", 0, 10, 3)
+    st.sidebar.subheader("📉 System Losses")
+    dc_losses = st.sidebar.slider("DC Losses (%)", 0, 15, 5, 1)
+    inverter_eff = st.sidebar.slider("Inverter Efficiency (%)", 85, 99, 96, 1)
+    ac_losses = st.sidebar.slider("AC Losses (%)", 0, 10, 3, 1)
     
     # Analysis period
-    st.sidebar.markdown("### Analysis")
-    analysis_days = st.sidebar.selectbox("Analysis Period", [30, 90, 365], index=2)
+    analysis_period = st.sidebar.selectbox("Analysis Period (days)", [30, 90, 180, 365], index=0)
     
-    # Calculate system specifications
+    # Calculate total system power
     total_power = panel_power * num_panels
-    system_efficiency = (100 - dc_losses) * inverter_efficiency * (100 - ac_losses) / 10000
     
-    # Generate weather data
-    with st.spinner("Generating weather data..."):
-        weather_df = generate_weather_data(latitude, analysis_days)
+    # System parameters dictionary
+    system_params = {
+        'total_power': total_power,
+        'panel_tilt': panel_tilt,
+        'panel_azimuth': panel_azimuth,
+        'temp_coeff': temp_coeff,
+        'noct': noct,
+        'dc_losses': dc_losses,
+        'inverter_eff': inverter_eff,
+        'ac_losses': ac_losses
+    }
     
-    # Calculate PV performance
-    with st.spinner("Calculating PV performance..."):
-        results = []
-        
-        for _, row in weather_df.iterrows():
-            # Calculate irradiance on tilted surface
-            total_irr, beam_irr, diff_irr = calculate_irradiance(
-                row['dni'], row['dhi'], row['ghi'],
-                row['solar_elevation'], panel_tilt, panel_azimuth, row['solar_azimuth']
-            )
-            
-            # Calculate PV power
-            dc_power, cell_temp = calculate_pv_power(
-                total_irr, row['temperature'], total_power, temperature_coeff, noct
-            )
-            
-            # Apply system losses
-            ac_power = dc_power * system_efficiency
-            
-            results.append({
-                'datetime': row['datetime'],
-                'temperature': row['temperature'],
-                'ghi': row['ghi'],
-                'poa_irradiance': total_irr,
-                'dc_power': dc_power,
-                'ac_power': ac_power,
-                'cell_temperature': cell_temp
-            })
-        
-        results_df = pd.DataFrame(results)
+    # Generate data and calculate performance
+    with st.spinner("🔄 Generating weather data and calculating performance..."):
+        weather_df = generate_weather_data(latitude, analysis_period)
+        performance_df = calculate_pv_performance(weather_df, system_params)
     
-    # Main content area
+    # Key metrics
+    st.markdown('<div class="section-header">📊 System Overview</div>', unsafe_allow_html=True)
+    
     col1, col2, col3, col4 = st.columns(4)
     
+    total_energy = performance_df['ac_power'].sum() / 1000  # kWh
+    avg_daily_energy = total_energy / analysis_period
+    specific_yield = total_energy / (total_power / 1000) if total_power > 0 else 0
+    max_power = performance_df['ac_power'].max()
+    
     with col1:
-        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-        st.metric("System Size", f"{total_power/1000:.1f} kW")
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="metric-box">
+            <h3>System Size</h3>
+            <h2>{total_power/1000:.1f} kW</h2>
+        </div>
+        """, unsafe_allow_html=True)
     
     with col2:
-        annual_energy = results_df['ac_power'].sum() / 1000  # kWh
-        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-        st.metric("Annual Energy", f"{annual_energy:.0f} kWh")
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="metric-box">
+            <h3>Total Energy</h3>
+            <h2>{total_energy:.0f} kWh</h2>
+        </div>
+        """, unsafe_allow_html=True)
     
     with col3:
-        specific_yield = annual_energy / (total_power/1000)  # kWh/kW
-        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-        st.metric("Specific Yield", f"{specific_yield:.0f} kWh/kW")
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="metric-box">
+            <h3>Daily Average</h3>
+            <h2>{avg_daily_energy:.1f} kWh/day</h2>
+        </div>
+        """, unsafe_allow_html=True)
     
     with col4:
-        performance_ratio = specific_yield / (weather_df['ghi'].sum() / 1000) * 100
-        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-        st.metric("Performance Ratio", f"{performance_ratio:.1f}%")
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="metric-box">
+            <h3>Peak Power</h3>
+            <h2>{max_power/1000:.1f} kW</h2>
+        </div>
+        """, unsafe_allow_html=True)
     
-    # Tabs for different analyses
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Performance Analysis", "📈 Time Series", "🌤️ Weather Data", "☀️ Solar Path", "📋 System Report"])
+    # Create tabs for different analyses
+    tab1, tab2, tab3, tab4 = st.tabs(["📈 Performance", "🌤️ Weather", "📅 Daily Profile", "📋 Data Export"])
     
     with tab1:
-        st.markdown('<h2 class="section-header">Performance Analysis</h2>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">Performance Analysis</div>', unsafe_allow_html=True)
         
-        # Monthly analysis
-        results_df['month'] = results_df['datetime'].dt.month
-        monthly_stats = results_df.groupby('month').agg({
+        # Monthly summary
+        performance_df['month'] = performance_df['datetime'].dt.month
+        monthly_summary = performance_df.groupby('month').agg({
             'ac_power': 'sum',
-            'ghi': 'sum',
-            'poa_irradiance': 'sum',
+            'ghi': 'mean',
             'temperature': 'mean'
         }).reset_index()
+        monthly_summary['energy_kwh'] = monthly_summary['ac_power'] / 1000
+        monthly_summary['month_name'] = monthly_summary['month'].map({
+            1: 'Jan', 2: 'Feb', 3: 'Mar', 4: 'Apr', 5: 'May', 6: 'Jun',
+            7: 'Jul', 8: 'Aug', 9: 'Sep', 10: 'Oct', 11: 'Nov', 12: 'Dec'
+        })
         
-        monthly_stats['energy_kwh'] = monthly_stats['ac_power'] / 1000
-        monthly_stats['month_name'] = pd.to_datetime(monthly_stats['month'], format='%m').dt.month_name()
-        
-        # Monthly energy chart
-        fig_monthly = go.Figure()
-        fig_monthly.add_trace(go.Bar(
-            x=monthly_stats['month_name'],
-            y=monthly_stats['energy_kwh'],
-            name='AC Energy (kWh)',
-            marker_color='#FF6B35'
-        ))
-        
-        fig_monthly.update_layout(
-            title="Monthly Energy Production",
-            xaxis_title="Month",
-            yaxis_title="Energy (kWh)",
-            height=400
-        )
-        
-        st.plotly_chart(fig_monthly, use_container_width=True)
-        
-        # Daily profile
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Average daily profile
-            results_df['hour'] = results_df['datetime'].dt.hour
-            hourly_avg = results_df.groupby('hour')['ac_power'].mean().reset_index()
+        if len(monthly_summary) > 1:
+            col1, col2 = st.columns(2)
             
-            fig_daily = go.Figure()
-            fig_daily.add_trace(go.Scatter(
-                x=hourly_avg['hour'],
-                y=hourly_avg['ac_power'],
-                mode='lines+markers',
-                name='Average Power',
-                line=dict(color='#2E86AB', width=3)
-            ))
+            with col1:
+                st.subheader("Monthly Energy Production")
+                fig, ax = plt.subplots(figsize=(10, 6))
+                bars = ax.bar(monthly_summary['month_name'], monthly_summary['energy_kwh'], 
+                             color='#FF6B35', alpha=0.8)
+                ax.set_ylabel('Energy (kWh)')
+                ax.set_title('Monthly Energy Production')
+                plt.xticks(rotation=45)
+                
+                # Add value labels on bars
+                for bar in bars:
+                    height = bar.get_height()
+                    ax.text(bar.get_x() + bar.get_width()/2., height,
+                           f'{height:.0f}', ha='center', va='bottom')
+                
+                st.pyplot(fig)
+                plt.close()
             
-            fig_daily.update_layout(
-                title="Average Daily Power Profile",
-                xaxis_title="Hour of Day",
-                yaxis_title="Power (W)",
-                height=300
-            )
-            
-            st.plotly_chart(fig_daily, use_container_width=True)
+            with col2:
+                st.subheader("Performance Metrics")
+                st.dataframe(monthly_summary[['month_name', 'energy_kwh', 'ghi', 'temperature']].rename(columns={
+                    'month_name': 'Month',
+                    'energy_kwh': 'Energy (kWh)',
+                    'ghi': 'Avg GHI (W/m²)',
+                    'temperature': 'Avg Temp (°C)'
+                }))
         
-        with col2:
-            # Irradiance vs Power scatter
-            sample_data = results_df.sample(min(1000, len(results_df)))
-            
-            fig_scatter = go.Figure()
-            fig_scatter.add_trace(go.Scatter(
-                x=sample_data['poa_irradiance'],
-                y=sample_data['ac_power'],
-                mode='markers',
-                name='Power vs Irradiance',
-                marker=dict(color=sample_data['temperature'], colorscale='RdYlBu_r', size=4),
-                text=sample_data['temperature'].round(1),
-                hovertemplate='Irradiance: %{x:.0f} W/m²<br>Power: %{y:.0f} W<br>Temp: %{text}°C'
-            ))
-            
-            fig_scatter.update_layout(
-                title="Power vs Irradiance",
-                xaxis_title="POA Irradiance (W/m²)",
-                yaxis_title="AC Power (W)",
-                height=300
-            )
-            
-            st.plotly_chart(fig_scatter, use_container_width=True)
+        # Power vs Irradiance plot
+        st.subheader("Power vs Irradiance Relationship")
+        sample_data = performance_df[performance_df['panel_irradiance'] > 0].sample(min(500, len(performance_df)))
+        
+        fig, ax = plt.subplots(figsize=(10, 6))
+        scatter = ax.scatter(sample_data['panel_irradiance'], sample_data['ac_power'], 
+                           c=sample_data['temperature'], cmap='RdYlBu_r', alpha=0.6)
+        ax.set_xlabel('Panel Irradiance (W/m²)')
+        ax.set_ylabel('AC Power (W)')
+        ax.set_title('AC Power vs Panel Irradiance (colored by temperature)')
+        plt.colorbar(scatter, label='Temperature (°C)')
+        st.pyplot(fig)
+        plt.close()
     
     with tab2:
-        st.markdown('<h2 class="section-header">Time Series Analysis</h2>', unsafe_allow_html=True)
-        
-        # Time series plot
-        fig_ts = make_subplots(
-            rows=3, cols=1,
-            subplot_titles=('Power Output', 'Solar Irradiance', 'Temperature'),
-            vertical_spacing=0.08
-        )
-        
-        # Sample data for visualization (every 24th point for daily resolution)
-        sample_df = results_df.iloc[::24]
-        
-        fig_ts.add_trace(
-            go.Scatter(x=sample_df['datetime'], y=sample_df['ac_power']/1000, 
-                      name='AC Power', line=dict(color='#FF6B35')),
-            row=1, col=1
-        )
-        
-        fig_ts.add_trace(
-            go.Scatter(x=sample_df['datetime'], y=sample_df['poa_irradiance'], 
-                      name='POA Irradiance', line=dict(color='#F7931E')),
-            row=2, col=1
-        )
-        
-        fig_ts.add_trace(
-            go.Scatter(x=sample_df['datetime'], y=sample_df['temperature'], 
-                      name='Temperature', line=dict(color='#2E86AB')),
-            row=3, col=1
-        )
-        
-        fig_ts.update_yaxes(title_text="Power (kW)", row=1, col=1)
-        fig_ts.update_yaxes(title_text="Irradiance (W/m²)", row=2, col=1)
-        fig_ts.update_yaxes(title_text="Temperature (°C)", row=3, col=1)
-        fig_ts.update_xaxes(title_text="Date", row=3, col=1)
-        
-        fig_ts.update_layout(height=600, showlegend=False)
-        
-        st.plotly_chart(fig_ts, use_container_width=True)
-    
-    with tab3:
-        st.markdown('<h2 class="section-header">Weather Data Analysis</h2>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">Weather Analysis</div>', unsafe_allow_html=True)
         
         col1, col2 = st.columns(2)
         
         with col1:
-            # GHI distribution
-            fig_ghi = go.Figure()
-            fig_ghi.add_trace(go.Histogram(
-                x=weather_df[weather_df['ghi'] > 0]['ghi'],
-                nbinsx=50,
-                name='GHI Distribution',
-                marker_color='#F7931E'
-            ))
+            st.subheader("Global Horizontal Irradiance")
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ghi_data = weather_df[weather_df['ghi'] > 0]['ghi']
+            ax.hist(ghi_data, bins=30, color='#F7931E', alpha=0.7, edgecolor='black')
+            ax.set_xlabel('GHI (W/m²)')
+            ax.set_ylabel('Frequency')
+            ax.set_title('GHI Distribution')
+            st.pyplot(fig)
+            plt.close()
             
-            fig_ghi.update_layout(
-                title="Global Horizontal Irradiance Distribution",
-                xaxis_title="GHI (W/m²)",
-                yaxis_title="Frequency",
-                height=300
-            )
-            
-            st.plotly_chart(fig_ghi, use_container_width=True)
+            st.write(f"**Average GHI:** {weather_df['ghi'].mean():.1f} W/m²")
+            st.write(f"**Maximum GHI:** {weather_df['ghi'].max():.1f} W/m²")
         
         with col2:
-            # Temperature distribution
-            fig_temp = go.Figure()
-            fig_temp.add_trace(go.Histogram(
-                x=weather_df['temperature'],
-                nbinsx=50,
-                name='Temperature Distribution',
-                marker_color='#2E86AB'
-            ))
+            st.subheader("Temperature Distribution")
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.hist(weather_df['temperature'], bins=30, color='#2E86AB', alpha=0.7, edgecolor='black')
+            ax.set_xlabel('Temperature (°C)')
+            ax.set_ylabel('Frequency')
+            ax.set_title('Temperature Distribution')
+            st.pyplot(fig)
+            plt.close()
             
-            fig_temp.update_layout(
-                title="Temperature Distribution",
-                xaxis_title="Temperature (°C)",
-                yaxis_title="Frequency",
-                height=300
-            )
-            
-            st.plotly_chart(fig_temp, use_container_width=True)
+            st.write(f"**Average Temperature:** {weather_df['temperature'].mean():.1f}°C")
+            st.write(f"**Temperature Range:** {weather_df['temperature'].min():.1f}°C to {weather_df['temperature'].max():.1f}°C")
+    
+    with tab3:
+        st.markdown('<div class="section-header">Daily Profile Analysis</div>', unsafe_allow_html=True)
         
-        # Weather summary statistics
-        st.markdown("### Weather Summary Statistics")
-        weather_stats = weather_df.describe()
-        st.dataframe(weather_stats)
+        # Average hourly profile
+        hourly_avg = performance_df.groupby('hour').agg({
+            'ac_power': 'mean',
+            'ghi': 'mean',
+            'panel_irradiance': 'mean'
+        }).reset_index()
+        
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+        
+        # Power profile
+        ax1.plot(hourly_avg['hour'], hourly_avg['ac_power'], 'o-', color='#FF6B35', linewidth=2, label='AC Power')
+        ax1.set_xlabel('Hour of Day')
+        ax1.set_ylabel('Average AC Power (W)')
+        ax1.set_title('Average Daily Power Profile')
+        ax1.grid(True, alpha=0.3)
+        ax1.set_xlim(0, 23)
+        
+        # Irradiance profile
+        ax2.plot(hourly_avg['hour'], hourly_avg['ghi'], 'o-', color='#F7931E', linewidth=2, label='GHI')
+        ax2.plot(hourly_avg['hour'], hourly_avg['panel_irradiance'], 'o-', color='#2E86AB', linewidth=2, label='Panel Irradiance')
+        ax2.set_xlabel('Hour of Day')
+        ax2.set_ylabel('Average Irradiance (W/m²)')
+        ax2.set_title('Average Daily Irradiance Profile')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        ax2.set_xlim(0, 23)
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+        
+        # Show peak production hour
+        peak_hour = hourly_avg.loc[hourly_avg['ac_power'].idxmax(), 'hour']
+        peak_power = hourly_avg['ac_power'].max()
+        st.info(f"🏆 **Peak Production:** {peak_power:.0f} W at {peak_hour}:00")
     
     with tab4:
-        st.markdown('<h2 class="section-header">Solar Path Diagram</h2>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">Data Export & Summary</div>', unsafe_allow_html=True)
         
-        # Calculate solar path for different days of the year
-        days_of_year = [21, 80, 172, 266]  # Solstices and equinoxes
-        day_names = ["Winter Solstice", "Spring Equinox", "Summer Solstice", "Fall Equinox"]
-        
-        fig_solar = go.Figure()
-        
-        for i, day in enumerate(days_of_year):
-            hours = np.arange(6, 19, 0.5)
-            elevations = []
-            azimuths = []
-            
-            for hour in hours:
-                elev, azim = calculate_solar_position(latitude, day, hour)
-                if elev > 0:
-                    elevations.append(elev)
-                    azimuths.append(azim)
-            
-            if elevations:
-                fig_solar.add_trace(go.Scatter(
-                    x=azimuths,
-                    y=elevations,
-                    mode='lines+markers',
-                    name=day_names[i],
-                    line=dict(width=3)
-                ))
-        
-        fig_solar.update_layout(
-            title=f"Solar Path Diagram (Latitude: {latitude}°)",
-            xaxis_title="Solar Azimuth (°)",
-            yaxis_title="Solar Elevation (°)",
-            height=500
-        )
-        
-        st.plotly_chart(fig_solar, use_container_width=True)
-    
-    with tab5:
-        st.markdown('<h2 class="section-header">System Report</h2>', unsafe_allow_html=True)
-        
-        # System specifications
-        st.markdown("### System Specifications")
-        
-        specs_data = {
-            "Parameter": [
-                "Location",
-                "System Size",
-                "Panel Power",
-                "Number of Panels",
-                "Panel Tilt",
-                "Panel Azimuth",
-                "Temperature Coefficient",
-                "NOCT",
-                "DC Losses",
-                "Inverter Efficiency",
-                "AC Losses",
-                "Overall System Efficiency"
+        # System summary
+        st.subheader("System Summary")
+        summary_data = {
+            'Parameter': [
+                'Location',
+                'System Size (kW)',
+                'Panel Power (W)',
+                'Number of Panels',
+                'Panel Tilt (°)',
+                'Panel Azimuth (°)',
+                'Temperature Coefficient (%/°C)',
+                'NOCT (°C)',
+                'DC Losses (%)',
+                'Inverter Efficiency (%)',
+                'AC Losses (%)',
+                'Analysis Period (days)',
+                'Total Energy Production (kWh)',
+                'Average Daily Production (kWh/day)',
+                'Specific Yield (kWh/kW)',
+                'Peak AC Power (kW)'
             ],
-            "Value": [
-                f"{latitude:.1f}°, {longitude:.1f}°",
-                f"{total_power/1000:.1f} kW",
-                f"{panel_power} W",
+            'Value': [
+                f"{latitude:.1f}°N, {abs(longitude):.1f}°{'W' if longitude < 0 else 'E'}",
+                f"{total_power/1000:.1f}",
+                f"{panel_power}",
                 f"{num_panels}",
-                f"{panel_tilt}°",
-                f"{panel_azimuth}°",
-                f"{temperature_coeff}%/°C",
-                f"{noct}°C",
-                f"{dc_losses}%",
-                f"{inverter_efficiency}%",
-                f"{ac_losses}%",
-                f"{system_efficiency*100:.1f}%"
+                f"{panel_tilt}",
+                f"{panel_azimuth}",
+                f"{temp_coeff}",
+                f"{noct}",
+                f"{dc_losses}",
+                f"{inverter_eff}",
+                f"{ac_losses}",
+                f"{analysis_period}",
+                f"{total_energy:.1f}",
+                f"{avg_daily_energy:.1f}",
+                f"{specific_yield:.1f}",
+                f"{max_power/1000:.1f}"
             ]
         }
         
-        specs_df = pd.DataFrame(specs_data)
-        st.dataframe(specs_df, use_container_width=True)
+        summary_df = pd.DataFrame(summary_data)
+        st.dataframe(summary_df, use_container_width=True)
         
-        # Performance summary
-        st.markdown("### Performance Summary")
+        # Download options
+        st.subheader("📥 Download Data")
         
-        perf_data = {
-            "Metric": [
-                "Annual Energy Production",
-                "Specific Yield",
-                "Performance Ratio",
-                "Average Daily Production",
-                "Peak Power Output",
-                "Capacity Factor"
-            ],
-            "Value": [
-                f"{annual_energy:.0f} kWh",
-                f"{specific_yield:.0f} kWh/kW",
-                f"{performance_ratio:.1f}%",
-                f"{annual_energy/365:.1f} kWh/day",
-                f"{results_df['ac_power'].max()/1000:.1f} kW",
-                f"{(annual_energy/(total_power/1000*8760))*100:.1f}%"
-            ]
-        }
+        col1, col2 = st.columns(2)
         
-        perf_df = pd.DataFrame(perf_data)
-        st.dataframe(perf_df, use_container_width=True)
-        
-        # Download report
-        if st.button("Generate CSV Report"):
-            output = io.StringIO()
-            
-            # System info
-            output.write("SOLAR PV SYSTEM ANALYSIS REPORT\n")
-            output.write("="*50 + "\n\n")
-            output.write("System Specifications:\n")
-            specs_df.to_csv(output, index=False)
-            output.write("\n\nPerformance Summary:\n")
-            perf_df.to_csv(output, index=False)
-            output.write("\n\nMonthly Energy Production:\n")
-            monthly_stats[['month_name', 'energy_kwh']].to_csv(output, index=False)
-            
-            csv_data = output.getvalue()
-            
+        with col1:
+            # Convert performance data to CSV
+            csv_data = performance_df.to_csv(index=False)
             st.download_button(
-                label="Download Report",
+                label="📊 Download Performance Data (CSV)",
                 data=csv_data,
-                file_name=f"pv_system_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                file_name=f"pv_performance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv"
             )
+        
+        with col2:
+            # Convert summary to CSV
+            summary_csv = summary_df.to_csv(index=False)
+            st.download_button(
+                label="📋 Download System Summary (CSV)",
+                data=summary_csv,
+                file_name=f"pv_system_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
+        
+        # Show sample data
+        st.subheader("Sample Performance Data")
+        st.dataframe(performance_df.head(24), use_container_width=True)
 
 if __name__ == "__main__":
     main()
