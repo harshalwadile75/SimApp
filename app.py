@@ -1,366 +1,592 @@
+"""
+Enhanced Solar PV System Simulation App
+A comprehensive Streamlit application for solar photovoltaic system modeling and analysis.
+"""
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import matplotlib.pyplot as plt
+import seaborn as sns
 from datetime import datetime, timedelta
-import sys
-import os
+import requests
+import json
+from typing import Dict, Tuple, Optional, List
+import logging
 
-# Add src to path for imports
-sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-from pv_calculations import PVSystemCalculator
-from reliability_models import ReliabilityAnalyzer
-from config import APP_CONFIG
+# Solar modeling libraries
+try:
+    import pvlib
+    from pvlib import location, irradiance, atmosphere, solarposition
+    from pvlib.pvsystem import PVSystem
+    from pvlib.modelchain import ModelChain
+    PVLIB_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"pvlib not available: {e}")
+    PVLIB_AVAILABLE = False
+
+try:
+    import pvfactors
+    from pvfactors.geometry import OrderedPVArray
+    from pvfactors.irradiance import IsotropicOrdered
+    from pvfactors.engine import PVEngine
+    PVFACTORS_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"pvfactors not available: {e}")
+    PVFACTORS_AVAILABLE = False
+
+try:
+    import solarutils
+    SOLARUTILS_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"solarutils not available: {e}")
+    SOLARUTILS_AVAILABLE = False
 
 # Page configuration
 st.set_page_config(
-    page_title="PV System Simulator",
+    page_title="Solar PV System Simulator",
     page_icon="☀️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS
+# Custom CSS for better styling
 st.markdown("""
 <style>
-    .main-header {
-        font-size: 2.5rem;
-        color: #1f77b4;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 4px solid #1f77b4;
-    }
+.main-header {
+    font-size: 3rem;
+    color: #ff6b35;
+    text-align: center;
+    margin-bottom: 2rem;
+    background: linear-gradient(90deg, #ff6b35, #f7931e);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    font-weight: bold;
+}
+
+.metric-container {
+    background-color: #f0f2f6;
+    padding: 1rem;
+    border-radius: 10px;
+    margin: 0.5rem 0;
+}
+
+.stAlert {
+    border-radius: 10px;
+}
+
+.sidebar-content {
+    background-color: #fafafa;
+    padding: 1rem;
+    border-radius: 10px;
+    margin-bottom: 1rem;
+}
 </style>
 """, unsafe_allow_html=True)
 
+class SolarSimulator:
+    """Enhanced Solar PV System Simulator with error handling and validation."""
+    
+    def __init__(self):
+        self.location_data = None
+        self.weather_data = None
+        self.system_params = {}
+        
+    def validate_inputs(self, latitude: float, longitude: float) -> bool:
+        """Validate geographic inputs."""
+        if not (-90 <= latitude <= 90):
+            st.error("Latitude must be between -90 and 90 degrees")
+            return False
+        if not (-180 <= longitude <= 180):
+            st.error("Longitude must be between -180 and 180 degrees")
+            return False
+        return True
+    
+    def create_location(self, latitude: float, longitude: float, 
+                       timezone: str = 'UTC', altitude: float = 0) -> Optional[object]:
+        """Create pvlib Location object with error handling."""
+        if not PVLIB_AVAILABLE:
+            st.error("pvlib is not available. Please check the installation.")
+            return None
+            
+        try:
+            return location.Location(latitude, longitude, timezone, altitude)
+        except Exception as e:
+            st.error(f"Error creating location: {str(e)}")
+            return None
+    
+    def get_solar_position(self, loc, times) -> Optional[pd.DataFrame]:
+        """Calculate solar position with error handling."""
+        try:
+            return loc.get_solarposition(times)
+        except Exception as e:
+            st.error(f"Error calculating solar position: {str(e)}")
+            return None
+    
+    def calculate_clear_sky_irradiance(self, loc, times) -> Optional[pd.DataFrame]:
+        """Calculate clear sky irradiance with error handling."""
+        try:
+            return loc.get_clearsky(times)
+        except Exception as e:
+            st.error(f"Error calculating clear sky irradiance: {str(e)}")
+            return None
+    
+    def simulate_pv_system(self, loc, system_params: Dict, times) -> Optional[pd.DataFrame]:
+        """Simulate PV system performance."""
+        if not PVLIB_AVAILABLE:
+            return None
+            
+        try:
+            # Create PV system
+            system = PVSystem(
+                surface_tilt=system_params.get('tilt', 30),
+                surface_azimuth=system_params.get('azimuth', 180),
+                module_parameters=system_params.get('module_params', {}),
+                inverter_parameters=system_params.get('inverter_params', {}),
+                modules_per_string=system_params.get('modules_per_string', 10),
+                strings_per_inverter=system_params.get('strings_per_inverter', 2)
+            )
+            
+            # Create model chain
+            mc = ModelChain(system, loc, aoi_model='physical', 
+                          spectral_model='sapm', temperature_model='sapm')
+            
+            # Get weather data (clear sky for demo)
+            weather = loc.get_clearsky(times)
+            
+            # Run simulation
+            mc.run_model(weather)
+            
+            return mc.results.ac
+            
+        except Exception as e:
+            st.error(f"Error in PV system simulation: {str(e)}")
+            return None
+
+def create_sample_weather_data(times: pd.DatetimeIndex) -> pd.DataFrame:
+    """Create sample weather data for demonstration."""
+    np.random.seed(42)  # For reproducible results
+    
+    # Generate realistic solar irradiance patterns
+    hour_of_day = times.hour
+    day_of_year = times.dayofyear
+    
+    # Solar noon irradiance pattern
+    solar_noon_ghi = 1000 * np.sin(np.pi * (hour_of_day - 6) / 12) ** 2
+    solar_noon_ghi = np.maximum(solar_noon_ghi, 0)
+    
+    # Seasonal variation
+    seasonal_factor = 0.8 + 0.4 * np.sin(2 * np.pi * (day_of_year - 80) / 365)
+    
+    # Add some realistic noise
+    noise = np.random.normal(0, 50, len(times))
+    
+    ghi = solar_noon_ghi * seasonal_factor + noise
+    ghi = np.maximum(ghi, 0)  # No negative irradiance
+    
+    # DNI and DHI estimation
+    dni = ghi * 0.8 + np.random.normal(0, 30, len(times))
+    dni = np.maximum(dni, 0)
+    
+    dhi = ghi - dni * np.sin(np.radians(45))  # Simplified calculation
+    dhi = np.maximum(dhi, 0)
+    
+    # Temperature variation
+    temp_air = 20 + 15 * np.sin(2 * np.pi * (day_of_year - 80) / 365) + \
+               10 * np.sin(2 * np.pi * hour_of_day / 24) + \
+               np.random.normal(0, 2, len(times))
+    
+    wind_speed = 5 + np.random.exponential(3, len(times))
+    
+    return pd.DataFrame({
+        'ghi': ghi,
+        'dni': dni,
+        'dhi': dhi,
+        'temp_air': temp_air,
+        'wind_speed': wind_speed
+    }, index=times)
+
 def main():
+    """Main application function."""
+    
     # Header
-    st.markdown('<h1 class="main-header">☀️ PV System Simulator & Material Quality Analyzer</h1>', 
+    st.markdown('<h1 class="main-header">☀️ Solar PV System Simulator</h1>', 
                 unsafe_allow_html=True)
     
-    # Sidebar for system parameters
+    # Check library availability
+    if not PVLIB_AVAILABLE:
+        st.error("⚠️ pvlib is not installed. Some features may not work properly.")
+        st.info("To install pvlib, run: `pip install pvlib`")
+    
+    # Initialize simulator
+    simulator = SolarSimulator()
+    
+    # Sidebar for inputs
     with st.sidebar:
+        st.markdown('<div class="sidebar-content">', unsafe_allow_html=True)
+        st.header("🌍 Location Settings")
+        
+        # Location inputs
+        latitude = st.number_input("Latitude (degrees)", 
+                                 min_value=-90.0, max_value=90.0, 
+                                 value=37.7749, step=0.1,
+                                 help="Positive for North, negative for South")
+        
+        longitude = st.number_input("Longitude (degrees)", 
+                                  min_value=-180.0, max_value=180.0, 
+                                  value=-122.4194, step=0.1,
+                                  help="Positive for East, negative for West")
+        
+        altitude = st.number_input("Altitude (meters)", 
+                                 min_value=0, max_value=9000, 
+                                 value=0, step=10)
+        
+        timezone = st.selectbox("Timezone", 
+                              ['UTC', 'US/Pacific', 'US/Eastern', 'Europe/London', 
+                               'Asia/Tokyo', 'Australia/Sydney'],
+                              index=0)
+        
         st.header("🔧 System Configuration")
         
-        # Basic system parameters
-        st.subheader("Panel Specifications")
-        panel_power = st.number_input("Panel Power (W)", min_value=100, max_value=600, value=400)
-        panel_efficiency = st.slider("Panel Efficiency (%)", min_value=15.0, max_value=25.0, value=20.0, step=0.1)
-        num_panels = st.number_input("Number of Panels", min_value=1, max_value=1000, value=20)
+        # System parameters
+        system_capacity = st.number_input("System Capacity (kW)", 
+                                        min_value=1.0, max_value=1000.0, 
+                                        value=10.0, step=0.5)
         
-        st.subheader("System Configuration")
-        tilt_angle = st.slider("Tilt Angle (°)", min_value=0, max_value=90, value=30)
-        azimuth = st.slider("Azimuth (°)", min_value=0, max_value=360, value=180)
+        tilt = st.slider("Panel Tilt (degrees)", 
+                        min_value=0, max_value=90, value=30)
         
-        st.subheader("Location")
-        latitude = st.number_input("Latitude", min_value=-90.0, max_value=90.0, value=40.7128)
-        longitude = st.number_input("Longitude", min_value=-180.0, max_value=180.0, value=-74.0060)
+        azimuth = st.slider("Panel Azimuth (degrees)", 
+                          min_value=0, max_value=360, value=180,
+                          help="0=North, 90=East, 180=South, 270=West")
+        
+        st.header("📅 Simulation Period")
+        
+        # Time range selection
+        start_date = st.date_input("Start Date", 
+                                 value=datetime.now().date())
+        
+        end_date = st.date_input("End Date", 
+                               value=datetime.now().date() + timedelta(days=7))
+        
+        st.markdown('</div>', unsafe_allow_html=True)
     
-    # Main content tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 System Overview", "🔋 Energy Simulation", "🔬 Material Quality", "📈 Performance Analysis"])
+    # Validate inputs
+    if not simulator.validate_inputs(latitude, longitude):
+        return
     
-    # Initialize calculators
-    pv_calc = PVSystemCalculator()
-    reliability_analyzer = ReliabilityAnalyzer()
+    # Main content area
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard", "📈 Analysis", "🌤️ Weather", "ℹ️ System Info"])
     
     with tab1:
-        st.header("System Overview")
+        st.header("System Performance Dashboard")
         
-        # System metrics
-        col1, col2, col3, col4 = st.columns(4)
-        
-        total_power = panel_power * num_panels / 1000  # kW
-        estimated_area = num_panels * 2.0  # Approximate area per panel
-        
-        with col1:
-            st.metric("Total System Power", f"{total_power:.1f} kW")
-        with col2:
-            st.metric("Number of Panels", f"{num_panels}")
-        with col3:
-            st.metric("Estimated Area", f"{estimated_area:.1f} m²")
-        with col4:
-            st.metric("System Efficiency", f"{panel_efficiency:.1f}%")
-        
-        # System visualization
-        st.subheader("System Layout Visualization")
-        
-        # Create a simple system layout plot
-        fig = go.Figure()
-        
-        # Calculate panel positions (simple grid layout)
-        panels_per_row = int(np.sqrt(num_panels))
-        rows = int(np.ceil(num_panels / panels_per_row))
-        
-        x_positions = []
-        y_positions = []
-        for i in range(num_panels):
-            row = i // panels_per_row
-            col = i % panels_per_row
-            x_positions.append(col * 2)
-            y_positions.append(row * 1)
-        
-        fig.add_trace(go.Scatter(
-            x=x_positions,
-            y=y_positions,
-            mode='markers',
-            marker=dict(size=20, color='blue', symbol='square'),
-            name='Solar Panels',
-            text=[f'Panel {i+1}' for i in range(num_panels)],
-            hovertemplate='<b>%{text}</b><br>Power: {}W<extra></extra>'.format(panel_power)
-        ))
-        
-        fig.update_layout(
-            title="System Layout",
-            xaxis_title="Position (m)",
-            yaxis_title="Position (m)",
-            showlegend=True,
-            height=400
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
+        if PVLIB_AVAILABLE:
+            # Create location
+            loc = simulator.create_location(latitude, longitude, timezone, altitude)
+            
+            if loc is not None:
+                # Generate time series
+                times = pd.date_range(start=start_date, end=end_date, 
+                                    freq='1H', tz=timezone)
+                
+                # Calculate solar position
+                with st.spinner("Calculating solar position..."):
+                    solar_pos = simulator.get_solar_position(loc, times)
+                
+                if solar_pos is not None:
+                    # Display key metrics
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        max_elevation = solar_pos['apparent_elevation'].max()
+                        st.metric("Max Solar Elevation", f"{max_elevation:.1f}°")
+                    
+                    with col2:
+                        daylight_hours = len(solar_pos[solar_pos['apparent_elevation'] > 0])
+                        st.metric("Daylight Hours", f"{daylight_hours}")
+                    
+                    with col3:
+                        st.metric("System Capacity", f"{system_capacity} kW")
+                    
+                    with col4:
+                        st.metric("Panel Tilt", f"{tilt}°")
+                    
+                    # Solar path visualization
+                    st.subheader("☀️ Solar Path Visualization")
+                    
+                    fig = px.scatter(solar_pos.reset_index(), 
+                                   x='azimuth', y='apparent_elevation',
+                                   color='apparent_elevation',
+                                   size='apparent_elevation',
+                                   hover_data=['index'],
+                                   title="Solar Path Throughout Simulation Period",
+                                   labels={'azimuth': 'Solar Azimuth (degrees)',
+                                          'apparent_elevation': 'Solar Elevation (degrees)'})
+                    
+                    fig.update_layout(height=500)
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Clear sky irradiance
+                    st.subheader("🌞 Clear Sky Irradiance")
+                    
+                    with st.spinner("Calculating clear sky irradiance..."):
+                        clearsky = simulator.calculate_clear_sky_irradiance(loc, times)
+                    
+                    if clearsky is not None:
+                        fig_irr = make_subplots(rows=2, cols=1,
+                                              subplot_titles=('Global Horizontal Irradiance', 
+                                                            'Direct Normal Irradiance'))
+                        
+                        fig_irr.add_trace(
+                            go.Scatter(x=clearsky.index, y=clearsky['ghi'],
+                                     name='GHI', line=dict(color='orange')),
+                            row=1, col=1
+                        )
+                        
+                        fig_irr.add_trace(
+                            go.Scatter(x=clearsky.index, y=clearsky['dni'],
+                                     name='DNI', line=dict(color='red')),
+                            row=2, col=1
+                        )
+                        
+                        fig_irr.update_xaxes(title_text="Time")
+                        fig_irr.update_yaxes(title_text="Irradiance (W/m²)")
+                        fig_irr.update_layout(height=600)
+                        
+                        st.plotly_chart(fig_irr, use_container_width=True)
+        else:
+            st.warning("Advanced solar calculations require pvlib installation.")
+            
+            # Show sample data visualization
+            st.subheader("📊 Sample Solar Data Visualization")
+            
+            # Generate sample time series
+            times = pd.date_range(start=start_date, end=end_date, freq='1H')
+            sample_data = create_sample_weather_data(times)
+            
+            fig = px.line(sample_data.reset_index(), x='index', y='ghi',
+                         title='Sample Global Horizontal Irradiance',
+                         labels={'index': 'Time', 'ghi': 'GHI (W/m²)'})
+            
+            st.plotly_chart(fig, use_container_width=True)
     
     with tab2:
-        st.header("Energy Simulation")
+        st.header("Detailed Analysis")
         
-        # Generate sample weather data
-        dates = pd.date_range(start='2024-01-01', end='2024-12-31', freq='D')
-        
-        # Simulate weather data (in real app, you'd load actual weather data)
-        np.random.seed(42)
-        irradiance = 800 + 400 * np.sin(2 * np.pi * np.arange(len(dates)) / 365) + np.random.normal(0, 100, len(dates))
-        irradiance = np.clip(irradiance, 0, 1200)
-        
-        temperature = 20 + 15 * np.sin(2 * np.pi * np.arange(len(dates)) / 365) + np.random.normal(0, 5, len(dates))
-        
-        weather_data = pd.DataFrame({
-            'date': dates,
-            'irradiance': irradiance,
-            'temperature': temperature
-        })
-        
-        # Calculate energy production
-        system_params = {
-            'panel_power': panel_power,
-            'num_panels': num_panels,
-            'efficiency': panel_efficiency / 100,
-            'tilt': tilt_angle,
-            'azimuth': azimuth
-        }
-        
-        daily_energy = pv_calc.calculate_daily_energy(weather_data, system_params)
-        weather_data['energy_kwh'] = daily_energy
-        
-        # Monthly aggregation
-        weather_data['month'] = weather_data['date'].dt.month
-        monthly_energy = weather_data.groupby('month')['energy_kwh'].sum()
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Annual energy chart
-            fig_monthly = px.bar(
-                x=monthly_energy.index,
-                y=monthly_energy.values,
-                title="Monthly Energy Production",
-                labels={'x': 'Month', 'y': 'Energy (kWh)'}
-            )
-            st.plotly_chart(fig_monthly, use_container_width=True)
-        
-        with col2:
-            # Daily energy over time
-            fig_daily = px.line(
-                weather_data,
-                x='date',
-                y='energy_kwh',
-                title="Daily Energy Production",
-                labels={'energy_kwh': 'Energy (kWh)', 'date': 'Date'}
-            )
-            st.plotly_chart(fig_daily, use_container_width=True)
-        
-        # Key metrics
-        total_annual_energy = weather_data['energy_kwh'].sum()
-        avg_daily_energy = weather_data['energy_kwh'].mean()
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Annual Energy Production", f"{total_annual_energy:.1f} kWh")
-        with col2:
-            st.metric("Average Daily Energy", f"{avg_daily_energy:.1f} kWh")
-        with col3:
-            st.metric("Capacity Factor", f"{(total_annual_energy / (total_power * 8760)) * 100:.1f}%")
+        if PVLIB_AVAILABLE and 'loc' in locals():
+            st.subheader("📈 Performance Metrics")
+            
+            # System parameters for simulation
+            system_params = {
+                'tilt': tilt,
+                'azimuth': azimuth,
+                'system_capacity': system_capacity
+            }
+            
+            # Simulate PV system (simplified)
+            times_analysis = pd.date_range(start=start_date, end=end_date, freq='1H', tz=timezone)
+            
+            with st.spinner("Running PV system simulation..."):
+                # Create sample weather data for analysis
+                weather_data = create_sample_weather_data(times_analysis)
+                
+                # Calculate basic PV output estimation
+                # Simplified calculation: Power = Irradiance * System_Capacity * Efficiency
+                efficiency = 0.15  # 15% system efficiency
+                pv_output = weather_data['ghi'] * system_capacity * efficiency / 1000  # kW
+                pv_output = np.maximum(pv_output, 0)
+                
+                # Daily energy production
+                daily_energy = pv_output.resample('D').sum()
+                
+                # Create performance visualization
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    fig_power = px.line(x=times_analysis, y=pv_output,
+                                       title='Estimated PV Power Output',
+                                       labels={'x': 'Time', 'y': 'Power (kW)'})
+                    st.plotly_chart(fig_power, use_container_width=True)
+                
+                with col2:
+                    if len(daily_energy) > 1:
+                        fig_energy = px.bar(x=daily_energy.index, y=daily_energy.values,
+                                          title='Daily Energy Production',
+                                          labels={'x': 'Date', 'y': 'Energy (kWh)'})
+                        st.plotly_chart(fig_energy, use_container_width=True)
+                
+                # Performance statistics
+                st.subheader("📊 Performance Statistics")
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    total_energy = pv_output.sum()
+                    st.metric("Total Energy Production", f"{total_energy:.1f} kWh")
+                
+                with col2:
+                    avg_power = pv_output.mean()
+                    st.metric("Average Power Output", f"{avg_power:.2f} kW")
+                
+                with col3:
+                    peak_power = pv_output.max()
+                    st.metric("Peak Power Output", f"{peak_power:.2f} kW")
+        else:
+            st.info("Detailed analysis requires location data from the Dashboard tab.")
     
     with tab3:
-        st.header("Material Quality & Reliability Analysis")
+        st.header("Weather Data Analysis")
         
-        # Module selection
-        st.subheader("PV Module Selection")
-        module_type = st.selectbox(
-            "Select Module Type",
-            ["Monocrystalline Silicon", "Polycrystalline Silicon", "Thin Film (CdTe)", "PERC", "Bifacial"]
-        )
+        # Weather data visualization
+        times_weather = pd.date_range(start=start_date, end=end_date, freq='1H')
+        weather_sample = create_sample_weather_data(times_weather)
         
-        manufacturer = st.selectbox(
-            "Manufacturer",
-            ["Tier 1 - Premium", "Tier 1 - Standard", "Tier 2", "Tier 3"]
-        )
+        st.subheader("🌤️ Weather Parameters")
         
-        # Reliability analysis
-        reliability_data = reliability_analyzer.analyze_module_reliability(module_type, manufacturer)
-        
-        col1, col2 = st.columns(2)
+        # Weather metrics
+        col1, col2, col3 = st.columns(3)
         
         with col1:
-            st.subheader("Degradation Analysis")
-            
-            # Create degradation curve
-            years = np.arange(0, 26)
-            degradation_rate = reliability_data['annual_degradation']
-            power_output = 100 * (1 - degradation_rate/100) ** years
-            
-            fig_deg = go.Figure()
-            fig_deg.add_trace(go.Scatter(
-                x=years,
-                y=power_output,
-                mode='lines+markers',
-                name='Power Output',
-                line=dict(color='red', width=3)
-            ))
-            
-            fig_deg.update_layout(
-                title="Power Degradation Over Time",
-                xaxis_title="Years",
-                yaxis_title="Power Output (%)",
-                height=400
-            )
-            
-            st.plotly_chart(fig_deg, use_container_width=True)
+            avg_ghi = weather_sample['ghi'].mean()
+            st.metric("Average GHI", f"{avg_ghi:.0f} W/m²")
         
         with col2:
-            st.subheader("Reliability Metrics")
-            
-            # Display reliability metrics
-            metrics = [
-                ("Annual Degradation Rate", f"{reliability_data['annual_degradation']:.2f}%"),
-                ("25-Year Performance", f"{reliability_data['performance_25y']:.1f}%"),
-                ("Expected Lifetime", f"{reliability_data['lifetime']:.0f} years"),
-                ("Failure Rate", f"{reliability_data['failure_rate']:.3f}%/year"),
-                ("Quality Grade", reliability_data['quality_grade'])
-            ]
-            
-            for metric, value in metrics:
-                st.metric(metric, value)
+            avg_temp = weather_sample['temp_air'].mean()
+            st.metric("Average Temperature", f"{avg_temp:.1f}°C")
         
-        # Test results simulation
-        st.subheader("Certified Test Results")
+        with col3:
+            avg_wind = weather_sample['wind_speed'].mean()
+            st.metric("Average Wind Speed", f"{avg_wind:.1f} m/s")
         
-        test_results = {
-            "IEC 61215 (Thermal Cycling)": "PASS",
-            "IEC 61215 (Humidity Freeze)": "PASS",
-            "IEC 61215 (Damp Heat)": "PASS",
-            "IEC 61730 (Safety)": "PASS",
-            "Salt Mist Test": "PASS" if reliability_data['quality_grade'] in ['A', 'B'] else "MARGINAL",
-            "UV Test": "PASS",
-            "Mechanical Load Test": "PASS"
-        }
+        # Weather plots
+        fig_weather = make_subplots(rows=2, cols=2,
+                                  subplot_titles=('Solar Irradiance Components',
+                                                'Temperature',
+                                                'Wind Speed',
+                                                'Irradiance vs Temperature'))
         
-        for test, result in test_results.items():
-            color = "🟢" if result == "PASS" else "🟡" if result == "MARGINAL" else "🔴"
-            st.write(f"{color} **{test}**: {result}")
+        # Irradiance components
+        fig_weather.add_trace(
+            go.Scatter(x=weather_sample.index, y=weather_sample['ghi'],
+                     name='GHI', line=dict(color='orange')),
+            row=1, col=1
+        )
+        
+        fig_weather.add_trace(
+            go.Scatter(x=weather_sample.index, y=weather_sample['dni'],
+                     name='DNI', line=dict(color='red')),
+            row=1, col=1
+        )
+        
+        # Temperature
+        fig_weather.add_trace(
+            go.Scatter(x=weather_sample.index, y=weather_sample['temp_air'],
+                     name='Temperature', line=dict(color='blue')),
+            row=1, col=2
+        )
+        
+        # Wind speed
+        fig_weather.add_trace(
+            go.Scatter(x=weather_sample.index, y=weather_sample['wind_speed'],
+                     name='Wind Speed', line=dict(color='green')),
+            row=2, col=1
+        )
+        
+        # Scatter plot: Irradiance vs Temperature
+        fig_weather.add_trace(
+            go.Scatter(x=weather_sample['temp_air'], y=weather_sample['ghi'],
+                     mode='markers', name='GHI vs Temp',
+                     marker=dict(color='purple', size=4)),
+            row=2, col=2
+        )
+        
+        fig_weather.update_layout(height=800, showlegend=False)
+        st.plotly_chart(fig_weather, use_container_width=True)
     
     with tab4:
-        st.header("Performance Analysis & Financial Metrics")
+        st.header("System Information")
         
-        # Economic parameters
-        st.subheader("Economic Analysis")
+        # Library status
+        st.subheader("📚 Library Status")
         
-        col1, col2 = st.columns(2)
-        with col1:
-            electricity_price = st.number_input("Electricity Price ($/kWh)", min_value=0.05, max_value=0.50, value=0.12, step=0.01)
-            system_cost = st.number_input("System Cost ($/W)", min_value=1.0, max_value=5.0, value=2.5, step=0.1)
+        status_data = {
+            'Library': ['pvlib', 'pvfactors', 'solarutils', 'streamlit', 'plotly', 'pandas'],
+            'Status': [
+                '✅ Available' if PVLIB_AVAILABLE else '❌ Not Available',
+                '✅ Available' if PVFACTORS_AVAILABLE else '❌ Not Available',
+                '✅ Available' if SOLARUTILS_AVAILABLE else '❌ Not Available',
+                '✅ Available',
+                '✅ Available',
+                '✅ Available'
+            ],
+            'Purpose': [
+                'Solar position and irradiance calculations',
+                'Bifacial PV modeling with view factors',
+                'Solar utility functions',
+                'Web application framework',
+                'Interactive plotting',
+                'Data manipulation'
+            ]
+        }
         
-        with col2:
-            maintenance_cost = st.number_input("Annual Maintenance ($/kW)", min_value=10, max_value=100, value=25)
-            discount_rate = st.slider("Discount Rate (%)", min_value=3.0, max_value=10.0, value=6.0, step=0.1)
+        status_df = pd.DataFrame(status_data)
+        st.dataframe(status_df, use_container_width=True)
         
-        # Financial calculations
-        total_system_cost = system_cost * total_power * 1000  # Total cost in $
-        annual_revenue = total_annual_energy * electricity_price
-        annual_maintenance = maintenance_cost * total_power
-        net_annual_revenue = annual_revenue - annual_maintenance
+        # System configuration summary
+        st.subheader("⚙️ Current Configuration")
         
-        # Simple payback period
-        payback_period = total_system_cost / net_annual_revenue
+        config_data = {
+            'Parameter': ['Latitude', 'Longitude', 'Altitude', 'Timezone', 
+                         'System Capacity', 'Panel Tilt', 'Panel Azimuth'],
+            'Value': [f"{latitude}°", f"{longitude}°", f"{altitude} m", timezone,
+                     f"{system_capacity} kW", f"{tilt}°", f"{azimuth}°"]
+        }
         
-        # NPV calculation (simplified)
-        years_analysis = 25
-        cash_flows = []
-        for year in range(1, years_analysis + 1):
-            # Account for degradation
-            yearly_energy = total_annual_energy * (1 - reliability_data['annual_degradation']/100) ** year
-            yearly_revenue = yearly_energy * electricity_price - annual_maintenance
-            discounted_revenue = yearly_revenue / (1 + discount_rate/100) ** year
-            cash_flows.append(discounted_revenue)
+        config_df = pd.DataFrame(config_data)
+        st.dataframe(config_df, use_container_width=True)
         
-        npv = sum(cash_flows) - total_system_cost
+        # Recommendations
+        st.subheader("💡 Recommendations")
         
-        # Display financial metrics
-        col1, col2, col3, col4 = st.columns(4)
+        if latitude > 0:  # Northern hemisphere
+            optimal_tilt = min(latitude + 15, 90)
+            if abs(tilt - optimal_tilt) > 10:
+                st.warning(f"Consider adjusting tilt to {optimal_tilt:.0f}° for better performance in your location.")
         
-        with col1:
-            st.metric("System Cost", f"${total_system_cost:,.0f}")
-        with col2:
-            st.metric("Annual Revenue", f"${annual_revenue:,.0f}")
-        with col3:
-            st.metric("Payback Period", f"{payback_period:.1f} years")
-        with col4:
-            st.metric("25-Year NPV", f"${npv:,.0f}")
+        if azimuth != 180 and latitude > 0:
+            st.info("For northern hemisphere locations, south-facing panels (180°) typically provide optimal performance.")
+        elif azimuth != 0 and latitude < 0:
+            st.info("For southern hemisphere locations, north-facing panels (0°) typically provide optimal performance.")
         
-        # Cash flow chart
-        st.subheader("25-Year Cash Flow Analysis")
+        # Help section
+        st.subheader("❓ Help & Documentation")
         
-        cumulative_cash_flow = [-total_system_cost]
-        yearly_cash_flows = [0]  # Year 0
+        with st.expander("How to use this application"):
+            st.markdown("""
+            1. **Location Settings**: Enter your geographic coordinates and timezone
+            2. **System Configuration**: Set your PV system parameters
+            3. **Simulation Period**: Choose the time range for analysis
+            4. **Dashboard**: View real-time solar position and irradiance data
+            5. **Analysis**: Examine detailed performance metrics
+            6. **Weather**: Analyze weather patterns affecting your system
+            """)
         
-        for year in range(1, years_analysis + 1):
-            yearly_energy = total_annual_energy * (1 - reliability_data['annual_degradation']/100) ** year
-            yearly_revenue = yearly_energy * electricity_price - annual_maintenance
-            yearly_cash_flows.append(yearly_revenue)
-            cumulative_cash_flow.append(cumulative_cash_flow[-1] + yearly_revenue)
-        
-        fig_cash = go.Figure()
-        fig_cash.add_trace(go.Scatter(
-            x=list(range(years_analysis + 1)),
-            y=cumulative_cash_flow,
-            mode='lines+markers',
-            name='Cumulative Cash Flow',
-            line=dict(color='green', width=3)
-        ))
-        
-        fig_cash.add_hline(y=0, line_dash="dash", line_color="red", annotation_text="Break-even")
-        
-        fig_cash.update_layout(
-            title="Cumulative Cash Flow Over 25 Years",
-            xaxis_title="Years",
-            yaxis_title="Cash Flow ($)",
-            height=400
-        )
-        
-        st.plotly_chart(fig_cash, use_container_width=True)
-
-# Health check endpoint for deployment
-def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+        with st.expander("Understanding the results"):
+            st.markdown("""
+            - **Solar Elevation**: Angle of the sun above the horizon
+            - **Solar Azimuth**: Compass direction of the sun
+            - **GHI**: Global Horizontal Irradiance (total solar radiation on horizontal surface)
+            - **DNI**: Direct Normal Irradiance (direct solar radiation perpendicular to surface)
+            - **DHI**: Diffuse Horizontal Irradiance (scattered solar radiation)
+            """)
 
 if __name__ == "__main__":
-    # Add health check route (for deployment monitoring)
-    if len(sys.argv) > 1 and sys.argv[1] == "health":
-        print(health_check())
-    else:
-        main()
+    main()
